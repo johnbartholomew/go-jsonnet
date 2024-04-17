@@ -4,8 +4,8 @@ load(
 )
 
 # NB: update_cpp_jsonnet.sh looks for these.
-CPP_JSONNET_SHA256 = "af7c9c102daab64de39fe9e479acc7389b8dd2d0647c2f9c6abc9c429070b0b8"
-CPP_JSONNET_GITHASH = "813c7412d1c7a42737724d011618d0fd7865bc69"
+CPP_JSONNET_SHA256 = "657edb19933282a6a52c0b06e87a1e853d5afddf2040c0e6b4ffcec82a483a8a"
+CPP_JSONNET_GITHASH = "e8e278ecef641fb88575679214f4b8b4a1eab7a9"
 
 def jsonnet_go_repositories():
     http_archive(
