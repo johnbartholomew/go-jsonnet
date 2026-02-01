@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 
@@ -237,88 +238,83 @@ func (vm *VM) evaluateSnippet(diagnosticFileName ast.DiagnosticFileName, filenam
 	return output, nil
 }
 
-func getAbsPath(path string) (string, error) {
+// getAbsPath returns an absolute path, and a _canonical_ path, or an error.
+func getAbsPath(path string) (string, string, error) {
 	var absPath string
 	if filepath.IsAbs(path) {
 		absPath = path
 	} else {
 		wd, err := os.Getwd()
 		if err != nil {
-			return "", nil
+			return "", "", nil
 		}
+		// Note this doesn't use filepath.Join, so it doesn't "clean" the path.
+		// This means that for example path is ../foo, and wd is /a/b, the result will be /a/b/../foo, not /a/foo.
+		// If `/a/b`` is a symlink to some other directory, then `/a/b/..`` is not equivalent to `/a`.
 		absPath = strings.Join([]string{wd, path}, string(filepath.Separator))
 	}
 	cleanedAbsPath, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return cleanedAbsPath, nil
+	return absPath, cleanedAbsPath, nil
 }
 
-func (vm *VM) findDependencies(filePath string, node *ast.Node, dependencies map[string]struct{}, stackTrace *[]TraceFrame) (err error) {
-	var cleanedAbsPath string
-	switch i := (*node).(type) {
-	case *ast.Import:
-		node, foundAt, err := vm.ImportAST(filePath, i.File.Value)
-		if err != nil {
-			*stackTrace = append([]TraceFrame{{Loc: *i.Loc()}}, *stackTrace...)
-			return err
-		}
-		cleanedAbsPath = foundAt
+func (vm *VM) findDependencies(filePath string, node ast.Node, dependencies map[string]string, stackTrace *[]TraceFrame) (err error) {
+	recordDep := func(node ast.Node, foundAt string) (bool, error) {
+		cleanedAbsPath := foundAt
+		absPath := foundAt
 		if _, isFileImporter := vm.importer.(*FileImporter); isFileImporter {
-			cleanedAbsPath, err = getAbsPath(foundAt)
+			absPath, cleanedAbsPath, err = getAbsPath(foundAt)
 			if err != nil {
-				*stackTrace = append([]TraceFrame{{Loc: *i.Loc()}}, *stackTrace...)
-				return err
+				*stackTrace = append(*stackTrace, TraceFrame{Loc: *node.Loc()})
+				return false, err
 			}
 		}
-		// Check that we haven't already parsed the imported file.
 		if _, alreadyParsed := dependencies[cleanedAbsPath]; alreadyParsed {
-			return nil
+			return false, nil
 		}
-		dependencies[cleanedAbsPath] = struct{}{}
-		err = vm.findDependencies(foundAt, &node, dependencies, stackTrace)
-		if err != nil {
-			*stackTrace = append([]TraceFrame{{Loc: *i.Loc()}}, *stackTrace...)
-			return err
+		dependencies[cleanedAbsPath] = absPath
+		return true, nil
+	}
+
+	var foundAt string
+	switch i := node.(type) {
+	case *ast.Import:
+		var newNode ast.Node
+		var newDep bool
+		// fmt.Printf("IMPORT recursing at %s into %s -> %s\n", node.Loc().String(), filePath, i.File.Value)
+		newNode, foundAt, err = vm.ImportAST(filePath, i.File.Value)
+		if err == nil {
+			newDep, err = recordDep(i, foundAt)
+		}
+		// fmt.Printf("dep %s -> %s, new = %v\n", filePath, i.File.Value, newDep)
+		if newDep && err == nil {
+			err = vm.findDependencies(foundAt, newNode, dependencies, stackTrace)
 		}
 	case *ast.ImportStr:
-		foundAt, err := vm.ResolveImport(filePath, i.File.Value)
-		if err != nil {
-			*stackTrace = append([]TraceFrame{{Loc: *i.Loc()}}, *stackTrace...)
-			return err
+		// fmt.Printf("IMPORTSTR recursing at %s\n", node.Loc().String())
+		foundAt, err = vm.ResolveImport(filePath, i.File.Value)
+		if err == nil {
+			_, err = recordDep(i, foundAt)
 		}
-		cleanedAbsPath = foundAt
-		if _, isFileImporter := vm.importer.(*FileImporter); isFileImporter {
-			cleanedAbsPath, err = getAbsPath(foundAt)
-			if err != nil {
-				*stackTrace = append([]TraceFrame{{Loc: *i.Loc()}}, *stackTrace...)
-				return err
-			}
-		}
-		dependencies[cleanedAbsPath] = struct{}{}
 	case *ast.ImportBin:
-		foundAt, err := vm.ResolveImport(filePath, i.File.Value)
-		if err != nil {
-			*stackTrace = append([]TraceFrame{{Loc: *i.Loc()}}, *stackTrace...)
-			return err
+		// fmt.Printf("IMPORTBIN recursing at %s\n", node.Loc().String())
+		foundAt, err = vm.ResolveImport(filePath, i.File.Value)
+		if err == nil {
+			_, err = recordDep(i, foundAt)
 		}
-		cleanedAbsPath = foundAt
-		if _, isFileImporter := vm.importer.(*FileImporter); isFileImporter {
-			cleanedAbsPath, err = getAbsPath(foundAt)
-			if err != nil {
-				*stackTrace = append([]TraceFrame{{Loc: *i.Loc()}}, *stackTrace...)
-				return err
-			}
-		}
-		dependencies[cleanedAbsPath] = struct{}{}
 	default:
-		for _, node := range parser.Children(i) {
-			err = vm.findDependencies(filePath, &node, dependencies, stackTrace)
+		for _, subNode := range parser.Children(i) {
+			// fmt.Printf("recursing at %s\n", node.Loc().String())
+			err = vm.findDependencies(filePath, subNode, dependencies, stackTrace)
 			if err != nil {
 				return err
 			}
 		}
+	}
+	if err != nil {
+		*stackTrace = append([]TraceFrame{{Loc: *node.Loc()}}, *stackTrace...)
 	}
 	return
 }
@@ -459,36 +455,38 @@ func (vm *VM) EvaluateFileMulti(filename string) (files map[string]string, forma
 // from all the given `importedPaths` which are themselves excluded from the returned array.
 // The `importedPaths` are parsed as if they were imported from a Jsonnet file located at `importedFrom`.
 func (vm *VM) FindDependencies(importedFrom string, importedPaths []string) ([]string, error) {
-	var nodes []*ast.Node
 	var stackTrace []TraceFrame
-	filePaths := make([]string, len(importedPaths))
-	depsToExclude := make([]string, len(importedPaths))
-	deps := make(map[string]struct{})
+	nodes := make([]ast.Node, 0, len(importedPaths))
+	filePaths := make([]string, 0, len(importedPaths))
+	depsToExclude := make([]string, 0, len(importedPaths))
+	deps := make(map[string]string)
 
-	for i, filePath := range importedPaths {
+	for _, filePath := range importedPaths {
 		node, foundAt, err := vm.ImportAST(importedFrom, filePath)
 		if err != nil {
 			return nil, err
 		}
 		cleanedAbsPath := foundAt
+		absPath := foundAt
 		if _, isFileImporter := vm.importer.(*FileImporter); isFileImporter {
-			cleanedAbsPath, err = getAbsPath(foundAt)
+			absPath, cleanedAbsPath, err = getAbsPath(foundAt)
 			if err != nil {
 				return nil, err
 			}
 		}
-		nodes = append(nodes, &node)
-		filePaths[i] = foundAt
+		nodes = append(nodes, node)
+		filePaths = append(filePaths, foundAt)
 
 		// Add `importedPaths` to the dependencies so that they are not parsed again.
 		// Will be removed before returning.
-		deps[cleanedAbsPath] = struct{}{}
-		depsToExclude[i] = cleanedAbsPath
+		deps[cleanedAbsPath] = absPath
+		depsToExclude = append(depsToExclude, cleanedAbsPath)
 	}
 
 	for i, filePath := range filePaths {
 		err := vm.findDependencies(filePath, nodes[i], deps, &stackTrace)
 		if err != nil {
+			slices.Reverse(stackTrace)
 			err = makeRuntimeError(err.Error(), stackTrace)
 			return nil, errors.New(vm.ErrorFormatter.Format(err))
 		}
@@ -499,10 +497,9 @@ func (vm *VM) FindDependencies(importedFrom string, importedPaths []string) ([]s
 		delete(deps, dep)
 	}
 
-	dependencies, i := make([]string, len(deps)), 0
-	for key := range deps {
-		dependencies[i] = key
-		i++
+	dependencies := make([]string, 0, len(deps))
+	for _, depPath := range deps {
+		dependencies = append(dependencies, depPath)
 	}
 	sort.Strings(dependencies)
 
